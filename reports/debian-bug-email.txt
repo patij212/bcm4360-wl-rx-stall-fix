@@ -1,3 +1,5 @@
+Filed 2026-11-24 as https://bugs.debian.org/1155126
+
 To: submit@bugs.debian.org
 Subject: broadcom-sta-dkms: RX stalls under load are CCMP replay drops on A-MSDU-in-A-MPDU (patch)
 
