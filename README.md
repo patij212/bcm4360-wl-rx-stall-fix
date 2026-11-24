@@ -13,6 +13,9 @@ because Broadcom's blob refuses that setting otherwise.
 > Tested on one card with one router. Please run the stall test before and after,
 > and report back either way.
 
+Reported to Ubuntu as [Launchpad bug #2175739](https://bugs.launchpad.net/ubuntu/+source/broadcom-sta/+bug/2175739).
+If it affects you too, mark it there with "This bug affects you".
+
 **New to this?** [docs/how-we-found-it.md](docs/how-we-found-it.md) explains the bug and
 how it was tracked down in plain language.
 
@@ -152,7 +155,7 @@ here, because Broadcom's license does not allow it.
 | `tools/unlock-iovars.py` | sets the whitelist bit in your local `wlc_hybrid.o_*` (`--check` = dry run) |
 | `tools/stall-test.sh` | reproduces the stall and counts it, no root; recovers each stall by reconnecting |
 | `tools/wlctl.py` | reads firmware counters and iovars (`counters`, `watch`, `get`, `set`) |
-| `reports/` | ready-to-file bug reports for Debian (email), Arch (GitLab) and Ubuntu (Launchpad); not filed yet, feel free to reuse them |
+| `reports/` | bug reports for Ubuntu (filed: [LP #2175739](https://bugs.launchpad.net/ubuntu/+source/broadcom-sta/+bug/2175739)), Debian (email) and Arch (GitLab); the last two are not filed yet, feel free to reuse them |
 | `tools/wltrace/` | debug only: separate GPL kprobe module that records each stored-PN jump with the frames and rx buffers around it (`/proc/wl_rxtrace`), plus decoders; offsets for 6.30.223.271 amd64 only, refuses to arm otherwise. Its raw output contains MAC addresses; the decoders do not print them |
 | `tools/keyview-debug.patch` | debug only: read-only `/proc/wl_keys` with the blob's stored receive PNs (no key bytes); offsets for 6.30.223.271 amd64 only; applies on top of 0001 and 0002 |
 | `apply.sh` | Debian/Ubuntu: builds a separate DKMS version `+amsdufix`; `--undo` reverts |

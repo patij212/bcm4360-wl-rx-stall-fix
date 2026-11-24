@@ -1,3 +1,5 @@
+Filed 2026-11-24 as https://bugs.launchpad.net/ubuntu/+source/broadcom-sta/+bug/2175739
+
 Title: broadcom-sta-dkms: BCM4360 stops receiving under load (CCMP replay drops); fix: decline A-MSDU in A-MPDU
 
 Package: broadcom-sta-dkms 6.30.223.271-29ubuntu1, Ubuntu 26.04, kernel 7.0.0-44-generic, BCM4360 [14e4:43a0]
