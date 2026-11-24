@@ -1,0 +1,159 @@
+Subject: [PATCH 3/3] wl_cfg80211: fix spurious disconnects during join (optional, independent)
+
+Four bugs in the open part of the driver, found while debugging the above:
+ 1. A stray "link down" event from the firmware during a new join cleared the
+    SSID mid-join; cfg80211 then warned (sme.c), rejected the WPA keys
+    ("key not allowed") and NetworkManager asked for the password again.
+    Link-down is now ignored while not connected, and a failed join is
+    reported as a clean connect failure.
+ 2. A fallback cfg80211_get_bss() lookup passed arguments in the pre-4.1 order
+    (asked for a 60 GHz open network) and could never match. Fixed.
+ 3. The firmware's disconnect reason was discarded (always 0). It is now
+    logged and passed to cfg80211.
+ 4. On connect, cfg80211 was made to look the AP up again by BSSID; after
+    failed scans its list had expired, so the join was reported "successful"
+    with no AP, then the handshake failed as a "wrong password". The AP entry
+    is now handed over directly (cfg80211_connect_bss, >= 4.11), and a missing
+    entry is reported as a clean failure that wpa_supplicant retries.
+
+--- a/src/wl/sys/wl_cfg80211_hybrid.c
++++ b/src/wl/sys/wl_cfg80211_hybrid.c
+@@ -2154,18 +2154,47 @@
+ 			wl_bss_connect_done(wl, ndev, e, data, true);
+ 			wl->profile->active = true;
+ 		}
+-		else if ((event == WLC_E_LINK && ~(flags & WLC_EVENT_MSG_LINK)) ||
++		else if ((event == WLC_E_LINK && !(flags & WLC_EVENT_MSG_LINK)) ||
+ 			event == WLC_E_DEAUTH_IND || event == WLC_E_DISASSOC_IND) {
++			/* the firmware's own reason. For DEAUTH/DISASSOC it is
++			 * the 802.11 reason code sent by the AP; for a LINK-down it is
++			 * the firmware's link-loss reason (1 = beacons lost). */
++			u32 reason = dtoh32(e->reason);
++			u16 reason_80211 = (event == WLC_E_LINK) ? 0 : (u16)reason;
++			bool connected = test_bit(WL_STATUS_CONNECTED, &wl->status);
++			bool connecting = test_bit(WL_STATUS_CONNECTING, &wl->status);
++
++			printk(KERN_INFO "wl: %s from %pM: reason %u, status %u%s\n",
++				event == WLC_E_LINK ? "link down" :
++				event == WLC_E_DEAUTH_IND ? "deauth from AP" :
++				"disassoc from AP",
++				&e->addr, reason, status,
++				connected ? "" : connecting ?
++				" (ignored: still connecting)" : " (ignored: not connected)");
++
++			/* only report a disconnect while connected. The
++			 * firmware sends a stray link-down when a new join starts;
++			 * reporting it wiped the SSID that cfg80211 and this driver
++			 * need to finish that join, so the join was reported "done"
++			 * with no BSS (WARNING in sme.c), cfg80211 then refused the
++			 * WPA keys ("key not allowed") and wpa_supplicant blamed a
++			 * wrong password. */
++			if (connected) {
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4,2,0)
+-			cfg80211_disconnected(ndev, 0, NULL, 0, GFP_KERNEL);
++				cfg80211_disconnected(ndev, reason_80211, NULL, 0, GFP_KERNEL);
+ #else
+-			cfg80211_disconnected(ndev, 0, NULL, 0, false, GFP_KERNEL);
++				cfg80211_disconnected(ndev, reason_80211, NULL, 0, false,
++					GFP_KERNEL);
+ #endif
+-			clear_bit(WL_STATUS_CONNECTED, &wl->status);
+-			wl_link_down(wl);
+-			wl_init_prof(wl->profile);
++				clear_bit(WL_STATUS_CONNECTED, &wl->status);
++				wl_link_down(wl);
++				wl_init_prof(wl->profile);
++			}
+ 		}
+-		else if (event == WLC_E_SET_SSID && status == WLC_E_STATUS_NO_NETWORKS) {
++		else if (event == WLC_E_SET_SSID && status != WLC_E_STATUS_SUCCESS) {
++			/* any failed join ends the connect attempt, not only
++			 * "no networks", now that stray link-downs no longer do. */
++			printk(KERN_INFO "wl: join failed, status %u\n", status);
+ 			wl_bss_connect_done(wl, ndev, e, data, false);
+ 		}
+ 		else {
+@@ -2398,8 +2427,17 @@
+ 		if (err)
+ 			goto update_bss_info_out;
+ 
++		/* since 4.1 these two arguments are a BSS type and a
++		 * privacy filter; WLAN_CAPABILITY_ESS (1) asked for a 60 GHz PBSS
++		 * with encryption off, which never matches a home router. */
+ 		bss = cfg80211_get_bss(wl_to_wiphy(wl), NULL, (s8 *)&wl->bssid,
+-		      ssid->SSID, ssid->SSID_len, WLAN_CAPABILITY_ESS, WLAN_CAPABILITY_ESS);
++		      ssid->SSID, ssid->SSID_len,
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 1, 0)
++		      WLAN_CAPABILITY_ESS, WLAN_CAPABILITY_ESS
++#else
++		      IEEE80211_BSS_TYPE_ESS, IEEE80211_PRIVACY_ANY
++#endif
++		      );
+ 
+ 		ie = ((u8 *)bi) + bi->ie_offset;
+ 		ie_len = bi->ie_length;
+@@ -2516,20 +2554,57 @@
+ 	}
+ 
+ 	if (test_and_clear_bit(WL_STATUS_CONNECTING, &wl->status)) {
++		struct cfg80211_bss *bss = NULL;
++		u16 result = completed ? WLAN_STATUS_SUCCESS : WLAN_STATUS_AUTH_TIMEOUT;
++
+ 		if (completed) {
+ 			wl_get_assoc_ies(wl);
+ 			memcpy(&wl->bssid, &e->addr, ETHER_ADDR_LEN);
+ 			memcpy(wl->profile->bssid, &e->addr, ETHER_ADDR_LEN);
++			/* adds the AP to cfg80211's list if it is not there */
+ 			wl_update_bss_info(wl);
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
++			/* hand cfg80211 the AP entry itself, as its docs
++			 * ask, instead of making it look the AP up again by BSSID
++			 * after scans have failed and its list has expired. If
++			 * the entry still cannot be found, report a clean failure
++			 * (wpa_supplicant retries at once) rather than "success"
++			 * with no AP, which half-connects and then fails the
++			 * handshake as a wrong password. */
++			bss = cfg80211_get_bss(wl_to_wiphy(wl), NULL, (u8 *)&wl->bssid,
++				wl->profile->ssid.SSID, wl->profile->ssid.SSID_len,
++				IEEE80211_BSS_TYPE_ESS, IEEE80211_PRIVACY_ANY);
++			if (!bss) {
++				scb_val_t scbval;
++
++				printk(KERN_INFO "wl: joined %pM but have no BSS entry for "
++					"it, reporting failure so the join is retried\n",
++					&wl->bssid);
++				result = WLAN_STATUS_UNSPECIFIED_FAILURE;
++				memcpy(&scbval.ea, &wl->bssid, ETHER_ADDR_LEN);
++				scbval.val = htod32(WLAN_REASON_DEAUTH_LEAVING);
++				wl_dev_ioctl(ndev, WLC_DISASSOC, &scbval, sizeof(scbval));
++			} else {
++				set_bit(WL_STATUS_CONNECTED, &wl->status);
++			}
++#else
+ 			set_bit(WL_STATUS_CONNECTED, &wl->status);
++#endif
+ 		}
+ 
+ 		WL_DBG(("Reporting BSS network join result \"%s\"\n",
+ 			wl->profile->ssid.SSID));
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
++		/* cfg80211 takes over the reference held on bss */
++		cfg80211_connect_bss(ndev, (u8 *)&wl->bssid, bss, conn_info->req_ie,
++		    conn_info->req_ie_len, conn_info->resp_ie, conn_info->resp_ie_len,
++		    result, GFP_KERNEL, NL80211_TIMEOUT_UNSPECIFIED);
++#else
+ 		cfg80211_connect_result(ndev, (u8 *)&wl->bssid,	conn_info->req_ie,
+ 		    conn_info->req_ie_len, conn_info->resp_ie, conn_info->resp_ie_len,
+-		    completed ? WLAN_STATUS_SUCCESS : WLAN_STATUS_AUTH_TIMEOUT,	GFP_KERNEL);
+-		WL_DBG(("Connection %s\n", completed ? "Succeeded" : "FAILed"));
++		    result, GFP_KERNEL);
++#endif
++		WL_DBG(("Connection %s\n", result == WLAN_STATUS_SUCCESS ? "Succeeded" : "FAILed"));
+ 	}
+ 
+ 	return err;
+@@ -3158,3 +3233,4 @@
+ }
+ 
+ #endif 
++

@@ -1,0 +1,53 @@
+Subject: [PATCH 1/3] wl: decline A-MSDU inside A-MPDU to stop RX replay stalls
+
+Under sustained load (100+ Mbit/s) the BCM4360 stops receiving: it stays
+associated and keeps transmitting, but every unicast frame from the AP is
+dropped as a CCMP replay (counters: rxdfrmucastmbss == rxundec == ccmpreplay)
+until the station reconnects and gets fresh keys.
+
+A/B tests show the closed binary mishandles the packet number of A-MSDUs that
+arrive inside A-MPDUs. With rx_amsdu_in_ampdu=0 the stalls stop and throughput
+is unchanged or better. The flag is only read when building the ADDBA response
+(wlc_ampdu_recv_addba_req_resp), so setting it once after wlc_attach covers
+every block-ack session. Declining A-MSDU in the ADDBA response is standard
+802.11 behaviour.
+
+The binary rejects this iovar unless its table entry has the whitelist flag
+0x4000 (see unlock-iovars.py); without that the driver logs "FAILED" and
+behaves as before.
+
+New module option: rx_amsdu_in_ampdu (0 default, 1 Broadcom default, -1 untouched).
+
+--- a/src/wl/sys/wl_linux.c
++++ b/src/wl/sys/wl_linux.c
+@@ -219,6 +219,16 @@
+ static int nompc = 0;
+ module_param(nompc, int, 0);
+ 
++/* The closed part of the driver mishandles the CCMP packet number of A-MSDUs that
++ * arrive inside an A-MPDU: its stored receive counter jumps ahead and every later
++ * unicast frame is dropped as a replay (RX stalls under load until a reconnect).
++ * 0 = tell the AP not to send them (A-MSDU-supported bit cleared in our ADDBA
++ * response), 1 = Broadcom default, -1 = leave the driver's own setting.
++ * Needs the iovar whitelist bit set in wlc_hybrid.o (unlock-iovars.py). */
++static int rx_amsdu_in_ampdu = 0;
++module_param(rx_amsdu_in_ampdu, int, 0444);
++MODULE_PARM_DESC(rx_amsdu_in_ampdu, "accept A-MSDU inside A-MPDU (0 = no, default; 1 = Broadcom default)");
++
+ #ifdef quote_str
+ #undef quote_str
+ #endif 
+@@ -639,6 +649,13 @@
+ 	 * confirms this. */
+ 	wlc_iovar_setint(wl->wlc, "qtxpower", 23 * 4);
+ 
++	if (rx_amsdu_in_ampdu >= 0) {
++		int amsdu_err = wlc_iovar_setint(wl->wlc, "rx_amsdu_in_ampdu", !!rx_amsdu_in_ampdu);
++		printk(KERN_INFO "wl%d: rx_amsdu_in_ampdu=%d %s (bcmerror %d)\n", unit,
++		       !!rx_amsdu_in_ampdu, amsdu_err ? "FAILED, run unlock-iovars.py on wlc_hybrid.o" : "set",
++		       amsdu_err);
++	}
++
+ #ifdef BCMDBG
+ 	if (macaddr != NULL) { 
+ 		int dbg_err;

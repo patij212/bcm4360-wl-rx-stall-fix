@@ -1,0 +1,82 @@
+Subject: [PATCH 2/3] wl: restore the private ioctl on kernels >= 5.15 (optional)
+
+Since 5.15, SIOCDEVPRIVATE only reaches ndo_siocdevprivate, so the "wl"
+utility interface (WLC_GET_VAR etc.) no longer works. This hooks it back up:
+CAP_NET_ADMIN gets the full ioctl as on older kernels; other users may only
+read the "counters" iovar. Needed by tools/wlctl.py to verify the fix and to
+read the replay counters. Not needed for the fix itself.
+
+--- a/src/wl/sys/wl_linux.c
++++ b/src/wl/sys/wl_linux.c
+@@ -121,6 +121,11 @@
+ 
+ static int wl_reg_proc_entry(wl_info_t *wl);
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
++static int wl_siocdevprivate(struct net_device *dev, struct ifreq *ifr,
++	void __user *data, int cmd);
++#endif
++
+ static int wl_linux_watchdog(void *ctx);
+ static
+ int wl_found = 0;
+@@ -467,6 +472,9 @@
+ #else
+ 	.ndo_set_multicast_list = wl_set_multicast_list,
+ #endif
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
++	.ndo_siocdevprivate = wl_siocdevprivate,
++#endif
+ 	.ndo_do_ioctl = wl_ioctl
+ };
+ 
+@@ -3496,3 +3504,49 @@
+ 	*addr = wl->bar1_addr;
+ 	return (wl->bar1_size);
+ }
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
++/* Since 5.15 SIOCDEVPRIVATE only reaches ndo_siocdevprivate. Root gets the full
++ * private ioctl (as on old kernels); other users may only read "counters". */
++static int wl_siocdevprivate(struct net_device *dev, struct ifreq *ifr,
++	void __user *data, int cmd)
++{
++	wl_info_t *wl;
++	wl_if_t *wlif;
++	wl_ioctl_t ioc;
++	char *buf;
++	int err;
++
++	if (cmd != SIOCDEVPRIVATE)
++		return -EOPNOTSUPP;
++	if (capable(CAP_NET_ADMIN))
++		return wl_ioctl(dev, ifr, cmd);
++
++	wlif = WL_DEV_IF(dev);
++	if (!wlif || !(wl = wlif->wl) || !wl->dev)
++		return -ENETDOWN;
++	if (copy_from_user(&ioc, data, sizeof(ioc)))
++		return -EFAULT;
++	if (ioc.cmd != WLC_GET_VAR || ioc.set || !ioc.buf || ioc.len < 16 ||
++	    ioc.len > WLC_IOCTL_MAXLEN)
++		return -EPERM;
++	if (!(buf = kzalloc(WLC_IOCTL_MAXLEN, GFP_KERNEL)))
++		return -ENOMEM;
++	err = -EFAULT;
++	if (copy_from_user(buf, ioc.buf, ioc.len))
++		goto out;
++	err = -EPERM;
++	if (memcmp(buf, "counters", 9))
++		goto out;
++	WL_LOCK(wl);
++	err = wlc_ioctl(wl->wlc, WLC_GET_VAR, buf, ioc.len, wlif->wlcif);
++	WL_UNLOCK(wl);
++	if (err)
++		err = OSL_ERROR(err);
++	else if (copy_to_user(ioc.buf, buf, ioc.len))
++		err = -EFAULT;
++out:
++	kfree(buf);
++	return err;
++}
++#endif

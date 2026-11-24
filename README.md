@@ -1,0 +1,124 @@
+# BCM4360 `wl` driver: fix for RX stalls under load (CCMP replay drops)
+
+If your Broadcom BCM4360 (or other `wl`/broadcom-sta card) **stops receiving during big
+downloads or streaming** (still "connected", sending works, nothing comes back until
+you reconnect Wi-Fi), this may be your bug. On the machine it was found on, it
+happened about **once a minute at 200–300 Mbit/s**. With this fix it went **20 minutes
+and 44.7 GB at an average 298 Mbit/s without a single stall**.
+
+The fix is one driver setting, `rx_amsdu_in_ampdu=0`, plus a small patch to the
+broadcom-sta source and an 11-byte unlock of your local copy of the binary blob,
+because Broadcom's blob refuses that setting otherwise.
+
+> Tested on one card with one router. Please run the stall test before and after,
+> and report back either way.
+
+## What happens
+
+During a stall, the firmware counters (read with `tools/wlctl.py`, which needs patch
+0002) show every unicast data frame from the AP being thrown away as a **replay**:
+
+```
+during one stall:  ucast-from-AP 36   undecryptable 36   replay 36
+                  (rxdfrmucastmbss)   (rxundec)          (ccmpreplay)
+```
+
+The driver's stored CCMP packet number for the link has jumped ahead of the AP's, so
+every new frame looks old. A reconnect installs new keys and resets the counter, which
+is why toggling Wi-Fi "fixes" it. Interrupts, DMA, ASPM, IOMMU and signal were all
+ruled out. It also happens within seconds of a fresh driver load.
+
+## Root cause (by experiment)
+
+A/B tests switched one setting at a time under the same 1 GB download load. Stalls
+were counted by a watchdog that detects and recovers them.
+
+| setting | stalls | throughput |
+|---|---|---|
+| `ampdu_rx=1` (default), 240 s | 4 | 190 Mbit/s |
+| `ampdu_rx=0`, 300 s | **0** | 60 Mbit/s |
+| `rx_amsdu_in_ampdu=1` (default), 240 s | 3 | 232 Mbit/s |
+| `rx_amsdu_in_ampdu=0`, 300 s | **0** | **346 Mbit/s** |
+| fixed driver, 20 min soak | **0** | 298 Mbit/s (44.7 GB) |
+
+So the closed binary mishandles the packet number of **A-MSDUs carried inside
+A-MPDUs** (802.11ac "A-MSDU in A-MPDU"). This is plausibly the same pitfall mac80211
+handles with `RX_FLAG_ALLOW_SAME_PN`: A-MSDU subframes share one PN. Turning off all
+A-MPDU receive also stops it but costs about 80% of the speed. Declining only the
+nested A-MSDUs costs nothing.
+
+How the setting is used (from disassembly of `wlc_hybrid.o_amd64`, broadcom-sta
+6.30.223.271): `rx_amsdu_in_ampdu` is a single byte in the `wlc` state. It is set to 1
+in `wlc_attach`, changed only by its iovar, and read only in
+`wlc_ampdu_recv_addba_req_resp`, i.e. when the driver answers the AP's ADDBA request.
+With it at 0, the A-MSDU-supported bit in our ADDBA response is cleared. That is
+standard 802.11, and the AP simply sends plain A-MPDUs. Setting it once right after
+`wlc_attach` therefore covers every block-ack session.
+
+## Why the blob has to be touched: the iovar whitelist
+
+On the hybrid Linux build, almost all driver settings (iovars) outside the core table
+return `BCME_UNSUPPORTED` (-23), including `ampdu*`, `amsdu*`, `rxchain`, `txchain`
+and even `bcmerror`. The reason is in `wlc_iovar_check` (offset `0x36005` in
+`wlc_hybrid.o_amd64`): if the iovar table entry's flags lack bit **0x4000**, it
+returns -23 before anything else is checked. Every iovar that works has that bit;
+every one that fails lacks it.
+
+`tools/unlock-iovars.py` sets bit 0x4000 on 11 named entries (the A-MPDU/A-MSDU
+settings and `bcmerror`). It locates each entry through its ELF relocation to the
+name string, refuses anything ambiguous, and changes exactly one 16-bit field per
+entry. It only edits **your own local copy**. The modified blob is not distributed
+here, because Broadcom's license does not allow it.
+
+## Files
+
+| file | what |
+|---|---|
+| `patches/0001-wl-decline-A-MSDU-inside-A-MPDU.patch` | **the fix**: module option `rx_amsdu_in_ampdu` (default 0), applied after attach |
+| `patches/0002-wl-restore-private-ioctl-on-5.15plus.patch` | optional: makes `wlctl.py` work on kernels ≥ 5.15 (root full access, others read `counters`) |
+| `patches/0003-wl_cfg80211-fix-spurious-disconnects-during-join.patch` | optional, independent: four join/disconnect bugs in the open cfg80211 glue (spurious "wrong password" after drops) |
+| `tools/unlock-iovars.py` | sets the whitelist bit in your local `wlc_hybrid.o_*` (`--check` = dry run) |
+| `tools/stall-test.sh` | reproduces the stall and counts it, no root; recovers each stall by reconnecting |
+| `tools/wlctl.py` | reads firmware counters and iovars (`counters`, `watch`, `get`, `set`) |
+| `apply.sh` | Debian/Ubuntu: builds a separate DKMS version `+amsdufix`; `--undo` reverts |
+
+Patches are against `broadcom-sta` 6.30.223.271 as shipped by Debian/Ubuntu
+(`broadcom-sta-dkms` 6.30.223.271-29ubuntu1, i.e. with the Debian patch series
+applied). They should apply to most packagings with little or no fuzz. The fix itself
+(0001) only needs the line that sets `qtxpower` after `wlc_attach` as context.
+
+## Try it
+
+1. Measure first, on a fast 5 GHz link: `bash tools/stall-test.sh` (10 min of downloads).
+2. Debian/Ubuntu: `sudo bash apply.sh`. Then check:
+   ```
+   cat /sys/module/wl/parameters/rx_amsdu_in_ampdu    # 0
+   journalctl -k | grep rx_amsdu_in_ampdu=            # "... set (bcmerror 0)"
+   ```
+   If the log says `FAILED`, the unlock did not happen and nothing changed.
+3. Measure again: `bash tools/stall-test.sh`.
+4. To compare without rebuilding: `sudo modprobe -r wl && sudo modprobe wl rx_amsdu_in_ampdu=1`
+   brings back Broadcom's behaviour until the next reload.
+
+Other distros: copy your wl source somewhere, apply 0001 (and 0002 if you want
+`wlctl.py`), run `python3 tools/unlock-iovars.py <source>/lib/<blob>.o*`, then build as
+you normally would. Arch's `broadcom-wl-dkms` keeps the source under
+`/usr/src/broadcom-wl-<version>`; `apply.sh` accepts `SRC=... NAME=broadcom-wl`, but it
+has only been run on Ubuntu.
+
+## Limits and unknowns
+
+- Shown on **one** BCM4360 (14e4:43a0, desktop PCIe card), one ISP-supplied 802.11ac
+  router (5 GHz, WPA2/CCMP), Ubuntu 26.04 with kernel 7.0. APs that never send A-MSDU
+  inside A-MPDU will not trigger the bug, so the fix does nothing there.
+- amd64 blob only. The i386 blob, if anyone still has one, would need its own offsets
+  checked; the script searches by name and should still work.
+- 2.4 GHz not tested.
+- The unlock also allows *setting* the other A-MPDU iovars as root. That is fine for
+  testing, but they are not needed for the fix.
+
+## Licence
+
+The patches modify the open (ISC-style licensed) part of broadcom-sta and are offered
+under the same terms. The tools are free to use and modify. The Broadcom binary blob is
+not included or redistributed.
