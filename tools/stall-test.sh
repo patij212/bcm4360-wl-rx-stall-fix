@@ -19,16 +19,23 @@ gw() { ip -4 route show default dev "$ifc" | awk '{print $3; exit}'; }
 
 echo "stall test: $ifc, $MINUTES min, $(iw dev "$ifc" link 2>/dev/null | awk '/freq/ {print $2 " MHz"}')"
 echo "driver option rx_amsdu_in_ampdu: $(cat /sys/module/wl/parameters/rx_amsdu_in_ampdu 2>/dev/null || echo 'not present (unpatched driver)')"
-end=$((SECONDS + MINUTES * 60)); stalls=0; t0=$SECONDS; b0=$(rx)
+end=$((SECONDS + MINUTES * 60)); stalls=0; t0=$SECONDS
 ( while [ $SECONDS -lt $end ]; do
-    curl -s -o /dev/null --max-time $((end - SECONDS)) "$URL"; sleep 1
+    curl -s -o /dev/null --speed-limit 100000 --speed-time 8 --max-time $((end - SECONDS)) "$URL"; sleep 1
   done ) &
 dl=$!
 trap 'kill $dl 2>/dev/null; exit 130' INT TERM
-last=$(rx); still=0
+# wl's rx_bytes is a 32-bit counter: it wraps every 4 GiB (~100 s at 350 Mbit/s),
+# so throughput is summed from per-second deltas instead of start/end values.
+last=$(rx); still=0; tot=0; mark=$SECONDS; tm=0
 while [ $SECONDS -lt $end ]; do
   sleep 1
   now=$(rx)
+  d=$((now - last)); [ $d -lt 0 ] && d=$((d + 4294967296)); tot=$((tot + d))
+  if [ $((SECONDS - mark)) -ge 60 ]; then
+    echo "$(date +%T)   last minute: $(( (tot - tm) * 8 / (SECONDS - mark) / 1000000 )) Mbit/s"
+    mark=$SECONDS; tm=$tot
+  fi
   if [ "$now" = "$last" ]; then still=$((still + 1)); else still=0; fi
   last=$now
   if [ $still -ge 3 ]; then
@@ -39,9 +46,9 @@ while [ $SECONDS -lt $end ]; do
       nmcli --wait 30 connection up uuid "$uuid" >/dev/null 2>&1
       echo "$(date +%T)   back after $((SECONDS - s)) s"
     fi
-    still=0; last=$(rx)
+    still=0; now=$(rx); d=$((now - last)); [ $d -lt 0 ] && d=$((d + 4294967296)); tot=$((tot + d)); last=$now
   fi
 done
 kill $dl 2>/dev/null; wait $dl 2>/dev/null
 dur=$((SECONDS - t0))
-echo "result: $stalls stall(s) in $dur s, average $(( ($(rx) - b0) * 8 / dur / 1000000 )) Mbit/s"
+echo "result: $stalls stall(s) in $dur s, average $(( tot * 8 / dur / 1000000 )) Mbit/s"

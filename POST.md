@@ -10,6 +10,7 @@ stops it completely, with no speed loss:
 
 - rx_amsdu_in_ampdu=1 (default): 3 stalls in 4 min, 232 Mbit/s
 - rx_amsdu_in_ampdu=0: 0 stalls in 5 min, 346 Mbit/s; then 0 stalls in a 20-min soak (298 Mbit/s, 44.7 GB)
+- re-checked from scratch: unmodified distro driver 5 stalls in 10 min; stock + only this fix 0 stalls in 10 min at 347 Mbit/s; same build with the option back to 1: 8 stalls in 5 min
 
 The setting only controls the A-MSDU bit in the driver's ADDBA response, so the AP
 just stops nesting A-MSDUs in A-MPDUs.

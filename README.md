@@ -41,6 +41,23 @@ were counted by a watchdog that detects and recovers them.
 | `rx_amsdu_in_ampdu=0`, 300 s | **0** | **346 Mbit/s** |
 | fixed driver, 20 min soak | **0** | 298 Mbit/s (44.7 GB) |
 
+### Clean check against the unmodified driver
+
+To rule out that the stall came from anything else changed while debugging, it was
+re-tested from scratch with `tools/stall-test.sh` (watchdog off):
+
+| driver | stalls | throughput |
+|---|---|---|
+| Ubuntu's `broadcom-sta-dkms`, unmodified, 10 min | **5** | (not measured reliably; see below) |
+| stock + patch 0001 + unlock only, installed with `apply.sh`, 10 min | **0** | 347 Mbit/s (every minute 325–358) |
+| same build, `modprobe wl rx_amsdu_in_ampdu=1`, 5 min | **8** | 194 Mbit/s |
+
+The first stall on the stock driver came within a minute. The same build flips
+between 0 and 8 stalls with nothing but the module option, so the option is what
+stops it. (The stock run's throughput isn't given because the first version of the
+test tool read `rx_bytes`, which this driver keeps as a 32-bit counter that wraps
+every 4 GiB. The tool now sums per-second deltas.)
+
 So the closed binary mishandles the packet number of **A-MSDUs carried inside
 A-MPDUs** (802.11ac "A-MSDU in A-MPDU"). This is plausibly the same pitfall mac80211
 handles with `RX_FLAG_ALLOW_SAME_PN`: A-MSDU subframes share one PN. Turning off all
