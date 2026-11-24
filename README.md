@@ -13,6 +13,9 @@ because Broadcom's blob refuses that setting otherwise.
 > Tested on one card with one router. Please run the stall test before and after,
 > and report back either way.
 
+**New to this?** [docs/how-we-found-it.md](docs/how-we-found-it.md) explains the bug and
+how it was tracked down in plain language.
+
 ## What happens
 
 During a stall, the firmware counters (read with `tools/wlctl.py`, which needs patch
