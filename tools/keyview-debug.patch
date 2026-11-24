@@ -1,0 +1,85 @@
+--- a/src/wl/sys/wl_linux.c
++++ b/src/wl/sys/wl_linux.c
+@@ -1065,6 +1065,7 @@
+ 		sprintf(tmp1, "%s%d", HYBRID_PROC, wl->pub->unit);
+ 		remove_proc_entry(tmp1, 0);
+ 		}
++		remove_proc_entry("wl_keys", NULL);
+ 		wlc_detach(wl->wlc);
+ 		wl->wlc = NULL;
+ 		wl->pub = NULL;
+@@ -3475,6 +3476,63 @@
+ #endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0) */
+ #endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 0) */
+ 
++/* ---- keyview (debug build only, never shipped) -----------------------------
++ * /proc/wl_keys: read-only view of the closed binary's CCMP receive counters.
++ * No key bytes are read. Offsets are from wlc_hybrid.o_amd64 6.30.223.271:
++ *   wlc + 0x318          wsec_key_t *wsec_keys[54]   (WLC_GET_KEY_SEQ handler)
++ *   key + 0x00 ea[6], +0x06 idx, +0x07 id, +0x08 algo, +0x10 len
++ *   key + 0x34 + 8*n     rxiv[n], n = 0..3: u32 hi, u16 lo  (wlc_key_iv_init,
++ *                        wlc_wsec_rxiv_update stores accepted PN + 1 here)
++ *   key + 0x54           txiv: u32 hi, u16 lo         (wlc_key_iv_update)
++ * A frame is dropped as a replay when its PN is lower than rxiv[slot].
++ */
++#include <linux/seq_file.h>
++#define KV_NKEYS 54
++struct kv_key { uint8 idx, id, algo, group; uint32 len; uint64 rx[4], tx; };
++
++static uint64 kv_iv(const uint8 *p)
++{
++	return ((uint64)*(const uint32 *)p << 16) | *(const uint16 *)(p + 4);
++}
++
++static int wl_keys_show(struct seq_file *m, void *v)
++{
++	wl_info_t *wl = m->private;
++	struct kv_key *kv;
++	int i, j, n = 0;
++
++	if (!(kv = kcalloc(KV_NKEYS, sizeof(*kv), GFP_KERNEL)))
++		return -ENOMEM;
++	WL_LOCK(wl);
++	if (wl->wlc) {
++		uint8 **keys = *(uint8 ***)((uint8 *)wl->wlc + 0x318);
++		for (i = 0; keys && i < KV_NKEYS; i++) {
++			const uint8 *k = keys[i];
++			if (!k || !*(const uint32 *)(k + 0x10))
++				continue;
++			kv[n].idx = i;
++			kv[n].id = k[7];
++			kv[n].algo = k[8];
++			kv[n].len = *(const uint32 *)(k + 0x10);
++			kv[n].group = !(k[0] | k[1] | k[2] | k[3] | k[4] | k[5]);
++			for (j = 0; j < 4; j++)
++				kv[n].rx[j] = kv_iv(k + 0x34 + 8 * j);
++			kv[n].tx = kv_iv(k + 0x54);
++			n++;
++		}
++	}
++	WL_UNLOCK(wl);
++	for (i = 0; i < n; i++) {
++		seq_printf(m, "key %2u id %u algo %u %s len %u rx", kv[i].idx, kv[i].id,
++			kv[i].algo, kv[i].group ? "group" : "pairwise", kv[i].len);
++		for (j = 0; j < 4; j++)
++			seq_printf(m, " %llu", (unsigned long long)kv[i].rx[j]);
++		seq_printf(m, " tx %llu\n", (unsigned long long)kv[i].tx);
++	}
++	kfree(kv);
++	return 0;
++}
++
+ static int
+ wl_reg_proc_entry(wl_info_t *wl)
+ {
+@@ -3495,6 +3553,10 @@
+ 	wl->proc_entry->write_proc = wl_proc_write;
+ 	wl->proc_entry->data = wl;
+ #endif
++	if (!proc_create_single_data("wl_keys", 0444, NULL, wl_keys_show, wl))
++		WL_ERROR(("%s: /proc/wl_keys failed\n", __FUNCTION__));
++	else
++		printk(KERN_INFO "wl: keyview debug build: /proc/wl_keys\n");
+ 	return 0;
+ }
+ uint32 wl_pcie_bar1(struct wl_info *wl, uchar** addr)

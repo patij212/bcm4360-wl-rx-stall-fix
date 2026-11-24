@@ -89,6 +89,7 @@ everything the moment reception stops.
 | 5 | Did the router change keys? | Looked for key exchanges in the logs | None between connecting and the first stall. **Not it.** |
 | 6 | What makes the number jump? | Switched features off one at a time and counted stalls | Pointed to the nested bundles (next section). |
 | 7 | Did our own earlier changes cause it? | Repeated the test from scratch on Ubuntu's untouched driver | The untouched driver stalled 5 times in 10 minutes. **It's in the original.** |
+| 8 | Does the stored number really jump? | Built a debug driver that shows the stored number, and watched it through 3 stalls | It jumped by 2 million to 1 billion at the exact moment each stall began (below). |
 
 ### The evidence from step 4
 
@@ -142,6 +143,42 @@ bundled transfer, the receiver replies "yes, and I accept A-MSDUs inside it" or
 the router nests A-MSDUs inside the bundles. Because that change alone makes the
 stalls go away, the bug must be in how the closed code handles those nested frames.
 
+### Watching the stored number (step 8)
+
+Broadcom's driver has no command that reports the stored number, so at first we could
+only infer it. In the closed code we then found where it keeps it: for each key, four
+"highest number accepted" slots, which it compares every encrypted frame against.
+We added a small read-only file, `/proc/wl_keys`, to a debug build of the driver.
+It shows those slots (never the key itself). Then we read it five times a second while
+downloading.
+
+With the fix on, for 60 seconds: the stored number climbed steadily, by about 1,000 to
+6,000 every fifth of a second, in step with the downloads. No replays.
+
+With the fix switched off, all three stalls looked the same:
+
+| Stall | Stored number just before | A fifth of a second later | Jump | Replays in that fifth of a second |
+|---|---|---|---|---|
+| 1 | 22,551 | 8,411,465 | +8.4 million | 407 |
+| 2 | 81,894 | 2,114,237 | +2.0 million | 290 |
+| 3 | 79,125 | 1,084,307,715 | +1.08 billion | 160 |
+
+- The jump and the first replays happen **in the same fifth of a second**, every time.
+- After the jump, the stored number **stays frozen** at the wrong value, because every
+  new frame is rejected. Nothing gets through until the reconnect replaces the key.
+- At full download speed the router's numbers went up by about 1,500 a second (about
+  80,000 in a minute). At that rate, catching up with even the smallest jump
+  (2 million) would take over 20 minutes, and the largest about 9 days. That is why
+  the stall doesn't end by itself.
+- The number is stored in two parts, a low part (16 bits) and a high part (32 bits).
+  In all three jumps the **low part carried on correctly**. Only the **high part
+  became a wrong value** (0x80, 0x20 and 0x40a1 instead of 0 or 1). So the driver
+  isn't miscounting. Part of the number it stores is wrong.
+
+The debug change is in [`tools/keyview-debug.patch`](../tools/keyview-debug.patch). It is
+for checking this result only. It reads memory locations taken from this one version of
+Broadcom's file, so don't use it with any other version.
+
 ### Checking the result
 
 - **Long test:** 20 minutes of full-speed downloads with the fix: 0 stalls,
@@ -170,20 +207,25 @@ counter rolls over every 4 GB. Its stall count was fine. The tool is fixed now.
   same driver build.
 - The setting changes only the answer the driver gives when the router sets up
   bundling.
+- The driver's stored "highest number" jumps far ahead of the router's at the moment
+  a stall begins, and stays there (step 8). The jump sizes were 2 million, 8 million
+  and 1 billion.
+- In those jumps, only the high part of the stored number went wrong. The low part
+  carried on normally.
 
 **Inferred (very likely, not seen directly):**
-- The driver's stored "highest number" jumps ahead of the router's. That is the
-  only way *every* frame can be a replay while the router keeps counting up
-  normally, and it fits with a new key fixing it.
-- It usually jumps a long way. The router keeps sending fresh, higher numbers, so a
-  small jump would be overtaken quickly and the stall would end by itself. Most
-  stalls didn't: in one, nothing got through for 14 seconds before we stepped in.
-  One very short stall did clear after about 3 seconds, so the size of the jump
-  seems to vary.
+- The nested A-MSDUs are what make the high part go wrong. The jumps only happen when
+  nested A-MSDUs are allowed. When the driver accepts a frame, it stores that frame's
+  number plus one. It does this before it splits an A-MSDU into its letters. Our best
+  guess: for some of these frames, it reads the high part of the number from the wrong
+  place. We have not seen which frame does it.
+- Short stalls. One earlier stall cleared by itself after about 3 seconds. Presumably
+  that jump was small enough for the router to overtake. All three we measured were
+  far too large for that.
 
 **Not known:**
-- The exact mistake inside Broadcom's code. It is closed source, and the stored
-  number is not visible from outside, so we see the effect, not the faulty line.
+- The exact faulty instruction inside Broadcom's code. It is closed source. We can see
+  the wrong number being stored, but not which code path stores it.
 - How many routers trigger it. Only routers that send A-MSDUs inside A-MPDUs can;
   ours does. This was tested with one card and one router.
 

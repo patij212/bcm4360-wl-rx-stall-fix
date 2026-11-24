@@ -28,7 +28,15 @@ during one stall:  ucast-from-AP 36   undecryptable 36   replay 36
 
 The driver's stored CCMP packet number for the link has jumped ahead of the AP's, so
 every new frame looks old. A reconnect installs new keys and resets the counter, which
-is why toggling Wi-Fi "fixes" it. Interrupts, DMA, ASPM, IOMMU and signal were all
+is why toggling Wi-Fi "fixes" it.
+
+This was measured directly with a debug build that exposes the blob's per-key receive
+counters (`tools/keyview-debug.patch`: read-only `/proc/wl_keys`, no key bytes; offsets
+are specific to 6.30.223.271 amd64). With `rx_amsdu_in_ampdu=1`, in three stalls the stored
+PN jumped from about 22k to 80k up to **8.4 M, 2.1 M and 1.08 G** in the same 200 ms interval
+in which the replay drops began. It then stayed frozen until the reconnect. The low 16 bits
+kept advancing normally, and only the high 32 bits took a wrong value (0x80, 0x20, 0x40a1).
+With the option at 0, 60 s at full speed showed steady growth and 0 replays. Interrupts, DMA, ASPM, IOMMU and signal were all
 ruled out. It also happens within seconds of a fresh driver load.
 
 ## Root cause (by experiment)
@@ -100,6 +108,7 @@ here, because Broadcom's license does not allow it.
 | `tools/unlock-iovars.py` | sets the whitelist bit in your local `wlc_hybrid.o_*` (`--check` = dry run) |
 | `tools/stall-test.sh` | reproduces the stall and counts it, no root; recovers each stall by reconnecting |
 | `tools/wlctl.py` | reads firmware counters and iovars (`counters`, `watch`, `get`, `set`) |
+| `tools/keyview-debug.patch` | debug only: read-only `/proc/wl_keys` with the blob's stored receive PNs (no key bytes); offsets for 6.30.223.271 amd64 only; applies on top of 0001 and 0002 |
 | `apply.sh` | Debian/Ubuntu: builds a separate DKMS version `+amsdufix`; `--undo` reverts |
 
 Patches are against `broadcom-sta` 6.30.223.271 as shipped by Debian/Ubuntu
