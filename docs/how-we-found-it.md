@@ -90,6 +90,7 @@ everything the moment reception stops.
 | 6 | What makes the number jump? | Switched features off one at a time and counted stalls | Pointed to the nested bundles (next section). |
 | 7 | Did our own earlier changes cause it? | Repeated the test from scratch on Ubuntu's untouched driver | The untouched driver stalled 5 times in 10 minutes. **It's in the original.** |
 | 8 | Does the stored number really jump? | Built a debug driver that shows the stored number, and watched it through 3 stalls | It jumped by 2 million to 1 billion at the exact moment each stall began (below). |
+| 9 | Which frame makes it jump, and why does the driver believe it? | A separate tracing module recorded every buffer the card handed over, and the exact frame whose number got stored | A "Frankenstein" frame, stitched from the start of one frame and the end of another (below). |
 
 ### The evidence from step 4
 
@@ -179,6 +180,64 @@ The debug change is in [`tools/keyview-debug.patch`](../tools/keyview-debug.patc
 for checking this result only. It reads memory locations taken from this one version of
 Broadcom's file, so don't use it with any other version.
 
+### Catching the bad frame (step 9)
+
+Step 8 showed *that* the number jumps. To see *which* frame does it, we wrote a small
+tracing module. It sits outside Broadcom's code and only watches. It notes every buffer
+the card hands to the driver and records the exact frame whose number gets stored
+whenever that number leaps ahead. We caught 10 jumps in two runs. In the 4 where every
+buffer was recorded, the picture was identical. The other 6 show the same signs
+(unusual sizes, too few pieces, flipped bits in the label).
+
+**How the card delivers a parcel of letters.** When a frame holds several letters
+(an A-MSDU inside an A-MPDU), the card does not hand it over in one piece. It puts
+each letter in its own tray (a memory buffer) and labels each tray "first", "middle"
+or "last". The "first" tray also holds a copy of the parcel's label, including its
+number. The "last" tray holds the card's verdict on the whole parcel: "decrypted fine,
+no damage". Each tray also gets a running tray number from the card. The driver
+then puts the parcel back together by those labels.
+
+**What goes wrong.** Normally a parcel arrives as first, middle, middle, last, with
+running tray numbers 1, 2, 3, 4. At every jump we caught, the card's sequence broke
+in the same way:
+
+1. Partway through a parcel, a tray arrives labelled **"first"** where the next
+   middle or last tray should be. It has an unusual size, and one field in the card's
+   own label is set that is zero on every normal tray.
+2. Its copy of the parcel label is **smudged**. The sequence number and the low part
+   of the frame number are right, but 3 to 15 bits further along are flipped. Those
+   bits include the high part of the number.
+3. Then the card's running tray number **skips** 3 to 31 trays. Those trays never
+   reach the driver. Once, a tray turned up with no card label at all, just the middle
+   of some frame's data.
+4. The next trays to arrive are the "middle" and "last" trays of a **later** parcel.
+
+Broadcom's code puts parcels together using only the first/middle/last labels. It
+does not check the running tray number. So it starts a new parcel with the smudged
+"first" tray and finishes it with the other parcel's "middle" and "last" trays. The
+"last" tray says "decrypted fine, no damage", which is true, but of the *other*
+parcel. The driver believes it and reads the frame number from the smudged label.
+That number is far higher than the stored one, so it passes the replay check and is
+stored. From then on, every real frame looks old.
+
+The card's own statistics agree. Over 60 seconds of downloads each:
+
+| | fix off (nested A-MSDUs allowed) | fix on |
+|---|---|---|
+| frames "too long" (`rxfrmtoolong`) | 115 | **0** |
+| frames bigger than a receive buffer (`rxgiant`) | 139 | **0** |
+| receive memory full (`rxf0ovfl`) | 145 | 46 |
+| replay drops (`ccmpreplay`) | 805 | **0** |
+
+In the traced run, the card delivered about 108,000 more "first" trays than "last"
+trays (1.69 million vs 1.58 million), and Broadcom's own count of broken parcels
+reached about 53,000. Most broken parcels are harmless: the next real "first" tray
+makes the driver throw the half-built parcel away. A stall needs the unlucky case,
+where the smudged "first" tray is followed directly by another parcel's ending.
+
+With the fix on, the router no longer puts letters inside the bundled parcels, so the
+card never splits frames into trays. There is nothing to stitch together wrongly.
+
 ### Checking the result
 
 - **Long test:** 20 minutes of full-speed downloads with the fix: 0 stalls,
@@ -210,29 +269,39 @@ counter rolls over every 4 GB. Its stall count was fine. The tool is fixed now.
 - The driver's stored "highest number" jumps far ahead of the router's at the moment
   a stall begins, and stays there (step 8). The jump sizes were 2 million, 8 million
   and 1 billion.
-- In those jumps, only the high part of the stored number went wrong. The low part
-  carried on normally.
+- In those jumps, the high part of the stored number went wrong. The low part
+  usually carried on normally.
+- The number that gets stored comes from a stitched frame: the start of one frame
+  (with a few flipped bits in its label) joined to the end of a later one, whose
+  "decrypted fine" verdict is trusted for the whole thing (step 9). Seen directly in
+  4 jumps, with the same signs in 6 more.
+- Broadcom's code joins the pieces by their first/middle/last labels only. It ignores
+  the card's running piece number, which shows the gap.
+- With nested A-MSDUs allowed, the card reports "frame too long" and "frame bigger than
+  a receive buffer" over 100 times a minute. With the fix, it reports none.
 
 **Inferred (very likely, not seen directly):**
-- The nested A-MSDUs are what make the high part go wrong. The jumps only happen when
-  nested A-MSDUs are allowed. When the driver accepts a frame, it stores that frame's
-  number plus one. It does this before it splits an A-MSDU into its letters. Our best
-  guess: for some of these frames, it reads the high part of the number from the wrong
-  place. We have not seen which frame does it.
+- The broken piece sequence and the "too long" / "bigger than a buffer" counts are the
+  same event seen from two sides. The card produces a piece it cannot fit, and the
+  pieces around it are lost or mislabelled.
 - Short stalls. One earlier stall cleared by itself after about 3 seconds. Presumably
   that jump was small enough for the router to overtake. All three we measured were
   far too large for that.
 
 **Not known:**
-- The exact faulty instruction inside Broadcom's code. It is closed source. We can see
-  the wrong number being stored, but not which code path stores it.
+- Why the card produces the oversized, mislabelled piece, and whether the flipped
+  bits happen on the air or inside the card. That part is in the card's own
+  microcode and hardware, which we cannot see.
+- What the one non-zero field in the bad piece's label means.
 - How many routers trigger it. Only routers that send A-MSDUs inside A-MPDUs can;
   ours does. This was tested with one card and one router.
 
-**A known pitfall:** Linux's own Wi-Fi code ran into the same trap. The letters
+**A related pitfall:** Linux's own Wi-Fi code ran into a similar trap. The letters
 from one A-MSDU all share one number, and the replay check rejected all but the
 first. Linux had to add a special rule for this case ([the Linux change](https://kunit.googlesource.com/linux/+/f631a77ba920f7153a1094d09cd8f2ebbffd0328)).
-Broadcom's code needs the same care, and evidently gets it wrong in some cases.
+Step 9 showed that Broadcom's problem is a different one: its pieces get mixed up
+between frames. But it is the same lesson: putting nested A-MSDUs back together is
+easy to get subtly wrong.
 
 ## Why the fix is safe
 

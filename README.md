@@ -39,6 +39,50 @@ kept advancing normally, and only the high 32 bits took a wrong value (0x80, 0x2
 With the option at 0, 60 s at full speed showed steady growth and 0 replays. Interrupts, DMA, ASPM, IOMMU and signal were all
 ruled out. It also happens within seconds of a fresh driver load.
 
+### How the bad number gets in (traced)
+
+A separate GPL debug module (`tools/wltrace/`, kprobes on the blob) recorded every rx
+buffer passed to `wlc_recv` and the frame behind every stored-PN jump. In the 4 jumps
+where every buffer was recorded, the sequence was identical:
+
+1. With hardware A-MSDU deaggregation, each subframe arrives in its own DMA buffer with
+   its own d11 rx header. RxStatus2 bits 1–2 say first/middle/last. Bits 10–15 hold a
+   running 6-bit piece counter.
+2. Partway through an MPDU, a buffer tagged **first** arrives at the position of the
+   next middle or last piece. It has an odd length (1462–1882 vs 1566), and rx-header
+   word 1 is 0x0200 (zero on every other piece). Its 802.11 header has the right
+   sequence number and usually the right PN[0..1], but 3–15 flipped bits in
+   QoS/key-ID/PN[2..5].
+3. The piece counter then skips 3–31 pieces. Once, a buffer starting with frame data
+   instead of an rx header was also seen.
+4. `wlc_recvamsdu` looks only at the first/middle/last bits. The odd "first" flushes
+   the open chain and starts a new one. The middle/last pieces of a **later** MPDU
+   complete it.
+5. The chain goes up with the later MPDU's last-piece status: decrypt attempted, no
+   decrypt or FCS error. `wlc_recvdata_ordered` parses the PN from the head's damaged
+   header. It passes the replay check (it is larger) and is stored by
+   `wlc_wsec_rxiv_update` before deaggregation. Every later frame is then a replay.
+
+The 6 jumps in an earlier traced run, which logged only the jump frame, show the same
+signs: odd head length, 2–3 pieces instead of 4, clean last-piece status, and flipped
+bits in the head's header.
+
+Card counters over 60 s of downloads each:
+
+| counter | `rx_amsdu_in_ampdu=1` | `=0` |
+|---|---|---|
+| `rxfrmtoolong` | 115 | 0 |
+| `rxgiant` | 139 | 0 |
+| `rxf0ovfl` | 145 | 46 |
+| `ccmpreplay` | 805 | 0 |
+
+In the traced run there were 1.69 M first pieces vs 1.58 M last pieces. Only one piece
+had the FCS-error bit, so FCS checking does not catch this. Unknown: why the MAC
+produces the odd piece, whether the bit errors happen on air or in the card, and what
+word 1 = 0x0200 means. A robust fix inside the blob would discard a chain whose piece
+counter is not continuous. That is not possible from the open wrapper, so the fix
+avoids nested A-MSDUs altogether.
+
 ## Root cause (by experiment)
 
 A/B tests switched one setting at a time under the same 1 GB download load. Stalls
@@ -108,6 +152,7 @@ here, because Broadcom's license does not allow it.
 | `tools/unlock-iovars.py` | sets the whitelist bit in your local `wlc_hybrid.o_*` (`--check` = dry run) |
 | `tools/stall-test.sh` | reproduces the stall and counts it, no root; recovers each stall by reconnecting |
 | `tools/wlctl.py` | reads firmware counters and iovars (`counters`, `watch`, `get`, `set`) |
+| `tools/wltrace/` | debug only: separate GPL kprobe module that records each stored-PN jump with the frames and rx buffers around it (`/proc/wl_rxtrace`), plus decoders; offsets for 6.30.223.271 amd64 only, refuses to arm otherwise. Its raw output contains MAC addresses; the decoders do not print them |
 | `tools/keyview-debug.patch` | debug only: read-only `/proc/wl_keys` with the blob's stored receive PNs (no key bytes); offsets for 6.30.223.271 amd64 only; applies on top of 0001 and 0002 |
 | `apply.sh` | Debian/Ubuntu: builds a separate DKMS version `+amsdufix`; `--undo` reverts |
 
@@ -150,4 +195,5 @@ has only been run on Ubuntu.
 
 The patches modify the open (ISC-style licensed) part of broadcom-sta and are offered
 under the same terms. The tools are free to use and modify. The Broadcom binary blob is
-not included or redistributed.
+not included or redistributed. `tools/wltrace/wltrace.c` is a separate kernel module under GPL-2.0, because
+kprobes are GPL-only; it is not linked into `wl`.
